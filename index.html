@@ -1,0 +1,246 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <title>LLUM-BOT MISSION CONTROL</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body, html { 
+      height: 100%; width: 100%; background: #000; 
+      overflow: hidden; font-family: 'Courier New', Courier, monospace;
+    }
+    
+    .viewport {
+      position: relative; width: 100vw; height: 100vh;
+      display: flex; align-items: center; justify-content: center;
+      background: radial-gradient(circle, #111 0%, #000 100%);
+    }
+
+    #stream {
+      width: 100%; height: 100%; object-fit: fill; 
+      z-index: 5;
+      transition: filter 0.5s ease;
+    }
+
+    /* HUD OVERLAY */
+    .hud-overlay {
+      position: absolute; top: 0; left: 0; width: 100%; height: 100%;
+      pointer-events: none; border: 1px solid rgba(0, 255, 204, 0.2);
+      box-shadow: inset 0 0 100px rgba(0, 0, 0, 0.6); z-index: 10;
+    }
+
+    .camera-selector, .mode-selector {
+      position: absolute; right: 70px; z-index: 20; pointer-events: auto;
+      color: #00FFCC; font-size: 14px; display: flex; align-items: center; gap: 10px;
+    }
+    .camera-selector { top: 30px; }
+    .mode-selector { top: 80px; }
+
+    select {
+      background: rgba(0, 40, 40, 0.6); color: #00FFCC; border: 1px solid #00FFCC;
+      padding: 5px 10px; font-family: inherit; cursor: pointer; outline: none;
+      text-transform: uppercase; box-shadow: 0 0 10px rgba(0, 255, 204, 0.2);
+    }
+
+    .status-bar {
+      position: absolute; top: 30px; left: 70px; color: #00FFCC;
+      font-size: 14px; text-transform: uppercase; letter-spacing: 2px;
+      text-shadow: 0 0 8px #00FFCC;
+    }
+    
+    .connection-status {
+      position: absolute; bottom: 30px; left: 50%; transform: translateX(-50%);
+      color: #00FFCC; font-size: 12px; letter-spacing: 4px; opacity: 0.8;
+    }
+
+    .rec-dot {
+      display: inline-block; width: 10px; height: 10px;
+      background: #FF0000; border-radius: 50%; margin-right: 10px;
+      animation: blink 1s infinite;
+    }
+    
+    @keyframes blink { 0% { opacity: 1; } 50% { opacity: 0; } 100% { opacity: 1; } }
+
+    .corner { position: absolute; width: 30px; height: 30px; border: 3px solid #00FFCC; }
+    .top-left { top: 20px; left: 20px; border-right: 0; border-bottom: 0; }
+    .top-right { top: 20px; right: 20px; border-left: 0; border-bottom: 0; }
+    .bottom-left { bottom: 20px; left: 20px; border-right: 0; border-top: 0; }
+    .bottom-right { bottom: 20px; right: 20px; border-left: 0; border-top: 0; }
+
+    .stale-stream { opacity: 0.4; filter: grayscale(1) !important; }
+  </style>
+</head>
+<body>
+
+  <div class="viewport">
+    <img id="stream" src="" alt="DATA_STREAM" />
+
+    <div class="hud-overlay">
+        <div class="camera-selector">
+            <label>CAM_INPUT_></label>
+            <select id="cam-select">
+                <option value="192.168.1.199">Robot_cam_1(199)</option>
+                <option value="192.168.1.177">Robot_cam_2(177)</option>
+                <option value="192.168.1.166">Model_cam_1(166)</option>
+                <option value="192.168.1.155">Model_cam_2(155)</option>
+                <option value="192.168.1.104">Model_cam_3(104)</option>
+            </select>
+        </div>
+
+        <div class="mode-selector">
+            <label>VISION_MODE_></label>
+            <select id="vision-mode">
+                <option value="normal">NORMAL</option>
+                <option value="thermal">THERMAL</option>
+                <option value="night">NIGHT_VIS</option>
+            </select>
+        </div>
+
+        <div class="status-bar">
+            <span class="rec-dot"></span> 
+            LIVE // <span id="mode-text">SECURE_FEED</span> // LLUM_BOT_S3
+        </div>
+        
+        <div id="conn-stat" class="connection-status">SIGNAL: IDLE</div>
+        
+        <div class="corner top-left"></div>
+        <div class="corner top-right"></div>
+        <div class="corner bottom-left"></div>
+        <div class="corner bottom-right"></div>
+    </div>
+  </div>
+
+  <script>
+    const img = document.getElementById('stream');
+    const connStat = document.getElementById('conn-stat');
+    const camSelect = document.getElementById('cam-select');
+    const visionSelect = document.getElementById('vision-mode');
+
+    // --- CONFIG ---
+    const BOUNDARY = "--ESP32CAM"; 
+    const READ_TIMEOUT_MS = 2000;
+    const MAX_BUFFER_BYTES = 2_000_000;
+
+    const enc = new TextEncoder();
+    const boundaryBytes = enc.encode(BOUNDARY);
+    const headerSepBytes = enc.encode("\r\n\r\n");
+
+    let lastObjectUrl = null;
+    let currentController = null;
+    let currentIP = camSelect.value;
+
+    const filters = {
+        normal: "none",
+        // Enhanced Thermal: Deep Blue to Yellow transition based on your reference
+        thermal: "brightness(1.1) contrast(1.5) grayscale(1) invert(1) sepia(1) hue-rotate(0deg) saturate(8)",
+        night: "sepia(100%) hue-rotate(90deg) brightness(1.2) saturate(2) contrast(1.5)"
+    };
+
+    // Helper functions
+    const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+    function concat(a, b) {
+      const out = new Uint8Array(a.length + b.length);
+      out.set(a, 0); out.set(b, a.length); return out;
+    }
+    function indexOfBytes(haystack, needle, from = 0) {
+      outer: for (let i = from; i <= haystack.length - needle.length; i++) {
+        for (let j = 0; j < needle.length; j++) {
+          if (haystack[i + j] !== needle[j]) continue outer;
+        }
+        return i;
+      }
+      return -1;
+    }
+
+    function renderJpegBytes(jpegBytes) {
+      const blob = new Blob([jpegBytes], { type: "image/jpeg" });
+      const url = URL.createObjectURL(blob);
+      img.src = url;
+      if (lastObjectUrl) URL.revokeObjectURL(lastObjectUrl);
+      lastObjectUrl = url;
+      connStat.innerText = "SIGNAL: NOMINAL";
+      connStat.style.color = "#00FFCC";
+      img.classList.remove('stale-stream');
+    }
+
+    async function readWithTimeout(reader, ms) {
+      const timeout = new Promise((_, reject) =>
+        setTimeout(() => reject(new Error("timeout")), ms)
+      );
+      return Promise.race([reader.read(), timeout]);
+    }
+
+    async function connectAndStream(ip) {
+      if (currentController) currentController.abort();
+      currentController = new AbortController();
+      
+      connStat.innerText = "SIGNAL: CONNECTING...";
+      connStat.style.color = "#FFCC00";
+      img.classList.add('stale-stream');
+
+      try {
+        const res = await fetch(`http://${ip}/stream?t=` + Date.now(), {
+          cache: "no-store",
+          signal: currentController.signal
+        });
+
+        if (!res.ok) throw new Error("HTTP " + res.status);
+        const reader = res.body.getReader();
+        let buffer = new Uint8Array(0);
+
+        while (true) {
+          const { value, done } = await readWithTimeout(reader, READ_TIMEOUT_MS);
+          if (done) throw new Error("end");
+          buffer = concat(buffer, value);
+
+          while (true) {
+            const b0 = indexOfBytes(buffer, boundaryBytes, 0);
+            if (b0 === -1) break;
+            const hs = indexOfBytes(buffer, headerSepBytes, b0);
+            if (hs === -1) break;
+            const jpegStart = hs + headerSepBytes.length;
+            const b1 = indexOfBytes(buffer, boundaryBytes, jpegStart);
+            if (b1 === -1) break;
+
+            let jpegEnd = b1;
+            if (jpegEnd >= 2 && buffer[jpegEnd-2] === 13 && buffer[jpegEnd-1] === 10) jpegEnd -= 2;
+
+            renderJpegBytes(buffer.slice(jpegStart, jpegEnd));
+            buffer = buffer.slice(b1);
+          }
+          if (buffer.length > MAX_BUFFER_BYTES) buffer = buffer.slice(-MAX_BUFFER_BYTES/4);
+        }
+      } catch (e) {
+        if (e.name === 'AbortError') return;
+        throw e;
+      }
+    }
+
+    async function runForever() {
+      while (true) {
+        try {
+          await connectAndStream(currentIP);
+        } catch (e) {
+          connStat.innerText = "SIGNAL: RECONNECTING...";
+          connStat.style.color = "#FF0000";
+          await sleep(1000);
+        }
+      }
+    }
+
+    // UI Listeners
+    camSelect.addEventListener('change', (e) => {
+        currentIP = e.target.value;
+        if (currentController) currentController.abort();
+    });
+
+    visionSelect.addEventListener('change', (e) => {
+        img.style.filter = filters[e.target.value];
+    });
+
+    // Launch
+    runForever();
+  </script>
+</body>
+</html>
