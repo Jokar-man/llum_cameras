@@ -6,7 +6,10 @@
   <title>LLUM-BOT MISSION CONTROL</title>
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
-    body, html { height: 100%; width: 100%; background: #000; overflow: hidden; font-family: 'Courier New', monospace; }
+    body, html { 
+      height: 100%; width: 100%; background: #000; 
+      overflow: hidden; font-family: 'Courier New', Courier, monospace;
+    }
     
     .viewport {
       position: relative; width: 100vw; height: 100vh;
@@ -14,10 +17,16 @@
       background: radial-gradient(circle, #111 0%, #000 100%);
     }
 
-    #stream, #recorded-video {
-      width: 100%; height: 100%; object-fit: fill; z-index: 5;
+    #stream, #rec-video {
+      width: 100%; 
+      height: 100%; 
+      object-fit: fill; 
+      z-index: 5;
       transition: filter 0.5s ease;
+      transform: rotate(180deg);
     }
+
+    #rec-video { display: none; }
 
     /* HUD OVERLAY */
     .hud-overlay {
@@ -36,7 +45,7 @@
     select {
       background: rgba(0, 40, 40, 0.6); color: #00FFCC; border: 1px solid #00FFCC;
       padding: 5px 10px; font-family: inherit; cursor: pointer; outline: none;
-      text-transform: uppercase;
+      text-transform: uppercase; box-shadow: 0 0 10px rgba(0, 255, 204, 0.2);
     }
 
     .status-bar {
@@ -63,14 +72,18 @@
     .top-right { top: 20px; right: 20px; border-left: 0; border-bottom: 0; }
     .bottom-left { bottom: 20px; left: 20px; border-right: 0; border-top: 0; }
     .bottom-right { bottom: 20px; right: 20px; border-left: 0; border-top: 0; }
+
+    .stale-stream { opacity: 0.4; filter: grayscale(1) !important; }
   </style>
 </head>
 <body>
 
   <div class="viewport">
     <img id="stream" src="" alt="DATA_STREAM" />
-    <video id="recorded-video" loop muted playsinline style="display:none;">
-        <source src="recorded video.mp4" type="video/mp4">
+
+    <!-- Recorded video element -->
+    <video id="rec-video" autoplay loop muted playsinline>
+      <source src="recorded video.mp4" type="video/mp4">
     </video>
 
     <div class="hud-overlay">
@@ -82,7 +95,7 @@
                 <option value="192.168.1.166">Model_cam_2(166)</option>
                 <option value="192.168.1.155">Model_cam_3(155)</option>
                 <option value="192.168.1.188">Robot_cam_2(188)</option>
-                <option value="camcorder">CAMCORDER (REC)</option> 
+                <option value="recorder">Cam_corder</option>
             </select>
         </div>
 
@@ -95,20 +108,38 @@
             </select>
         </div>
 
-        <div class="status-bar"><span class="rec-dot"></span> LIVE // SECURE_FEED // LLUM_BOT_S3</div>
+        <div class="status-bar">
+            <span class="rec-dot"></span> 
+            LIVE // <span id="mode-text">SECURE_FEED</span> // LLUM_BOT_S3
+        </div>
+        
         <div id="conn-stat" class="connection-status">SIGNAL: IDLE</div>
         
-        <div class="corner top-left"></div><div class="corner top-right"></div>
-        <div class="corner bottom-left"></div><div class="corner bottom-right"></div>
+        <div class="corner top-left"></div>
+        <div class="corner top-right"></div>
+        <div class="corner bottom-left"></div>
+        <div class="corner bottom-right"></div>
     </div>
   </div>
 
   <script>
     const img = document.getElementById('stream');
-    const videoEl = document.getElementById('recorded-video');
+    const video = document.getElementById('rec-video');
     const connStat = document.getElementById('conn-stat');
     const camSelect = document.getElementById('cam-select');
     const visionSelect = document.getElementById('vision-mode');
+
+    const BOUNDARY = "--ESP32CAM"; 
+    const READ_TIMEOUT_MS = 2000;
+    const MAX_BUFFER_BYTES = 2_000_000;
+
+    const enc = new TextEncoder();
+    const boundaryBytes = enc.encode(BOUNDARY);
+    const headerSepBytes = enc.encode("\r\n\r\n");
+
+    let lastObjectUrl = null;
+    let currentController = null;
+    let currentIP = camSelect.value;
 
     const filters = {
         normal: "none",
@@ -116,75 +147,134 @@
         night: "sepia(100%) hue-rotate(90deg) brightness(1.2) saturate(2) contrast(1.5)"
     };
 
-    let currentController = null;
-    let currentIP = camSelect.value;
-
-    const boundaryBytes = new TextEncoder().encode("--ESP32CAM");
-    const headerSepBytes = new TextEncoder().encode("\r\n\r\n");
+    const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+    function concat(a, b) {
+      const out = new Uint8Array(a.length + b.length);
+      out.set(a, 0); out.set(b, a.length); return out;
+    }
+    function indexOfBytes(haystack, needle, from = 0) {
+      outer: for (let i = from; i <= haystack.length - needle.length; i++) {
+        for (let j = 0; j < needle.length; j++) {
+          if (haystack[i + j] !== needle[j]) continue outer;
+        }
+        return i;
+      }
+      return -1;
+    }
 
     function renderJpegBytes(jpegBytes) {
-      const url = URL.createObjectURL(new Blob([jpegBytes], { type: "image/jpeg" }));
-      const oldUrl = img.src;
+      const blob = new Blob([jpegBytes], { type: "image/jpeg" });
+      const url = URL.createObjectURL(blob);
       img.src = url;
-      if (oldUrl.startsWith("blob:")) URL.revokeObjectURL(oldUrl);
+      if (lastObjectUrl) URL.revokeObjectURL(lastObjectUrl);
+      lastObjectUrl = url;
       connStat.innerText = "SIGNAL: NOMINAL";
       connStat.style.color = "#00FFCC";
+      img.classList.remove('stale-stream');
+    }
+
+    async function readWithTimeout(reader, ms) {
+      const timeout = new Promise((_, reject) =>
+        setTimeout(() => reject(new Error("timeout")), ms)
+      );
+      return Promise.race([reader.read(), timeout]);
     }
 
     async function connectAndStream(ip) {
+      if (ip === 'recorder') return; // Do nothing for recorded video
+
       if (currentController) currentController.abort();
       currentController = new AbortController();
       
+      connStat.innerText = "SIGNAL: CONNECTING...";
+      connStat.style.color = "#FFCC00";
+      img.classList.add('stale-stream');
+
       try {
-        const res = await fetch(`http://${ip}/stream`, { signal: currentController.signal });
+        const res = await fetch(`http://${ip}/stream?t=` + Date.now(), {
+          cache: "no-store",
+          signal: currentController.signal
+        });
+
+        if (!res.ok) throw new Error("HTTP " + res.status);
         const reader = res.body.getReader();
         let buffer = new Uint8Array(0);
 
         while (true) {
-          const { value, done } = await reader.read();
-          if (done) break;
-          const newBuf = new Uint8Array(buffer.length + value.length);
-          newBuf.set(buffer); newBuf.set(value, buffer.length);
-          buffer = newBuf;
+          const { value, done } = await readWithTimeout(reader, READ_TIMEOUT_MS);
+          if (done) throw new Error("end");
+          buffer = concat(buffer, value);
 
           while (true) {
-            const b0 = buffer.indexOf(boundaryBytes[0]); // Simple search
+            const b0 = indexOfBytes(buffer, boundaryBytes, 0);
             if (b0 === -1) break;
-            const hs = buffer.indexOf(headerSepBytes[0], b0);
+            const hs = indexOfBytes(buffer, headerSepBytes, b0);
             if (hs === -1) break;
-            const b1 = buffer.indexOf(boundaryBytes[0], hs + 4);
+            const jpegStart = hs + headerSepBytes.length;
+            const b1 = indexOfBytes(buffer, boundaryBytes, jpegStart);
             if (b1 === -1) break;
 
-            renderJpegBytes(buffer.slice(hs + 4, b1));
+            let jpegEnd = b1;
+            if (jpegEnd >= 2 && buffer[jpegEnd-2] === 13 && buffer[jpegEnd-1] === 10) jpegEnd -= 2;
+
+            renderJpegBytes(buffer.slice(jpegStart, jpegEnd));
             buffer = buffer.slice(b1);
           }
+          if (buffer.length > MAX_BUFFER_BYTES) buffer = buffer.slice(-MAX_BUFFER_BYTES/4);
         }
-      } catch (e) { if (e.name !== 'AbortError') setTimeout(() => connectAndStream(ip), 1000); }
+      } catch (e) {
+        if (e.name === 'AbortError') return;
+        throw e;
+      }
     }
+
+    async function runForever() {
+      while (true) {
+        try {
+          if (currentIP !== 'recorder') {
+            await connectAndStream(currentIP);
+          } else {
+            await sleep(200);
+          }
+        } catch (e) {
+          connStat.innerText = "SIGNAL: RECONNECTING...";
+          connStat.style.color = "#FF0000";
+          await sleep(1000);
+        }
+      }
+    }
+
 
     camSelect.addEventListener('change', (e) => {
         currentIP = e.target.value;
-        if (currentIP === "camcorder") {
-            if (currentController) currentController.abort();
+
+        // Stop any active stream immediately
+        if (currentController) currentController.abort();
+
+        if (currentIP === 'recorder') {
             img.style.display = 'none';
-            videoEl.style.display = 'block';
-            videoEl.play();
-            connStat.innerText = "SIGNAL: LOCAL_PLAYBACK";
+            video.style.display = 'block';
+            video.currentTime = 0;
+            video.play();
+            connStat.innerText = "PLAYBACK: Cam_corder";
+            connStat.style.color = "#00FFCC";
         } else {
-            videoEl.pause();
-            videoEl.style.display = 'none';
+            video.pause();
+            video.style.display = 'none';
             img.style.display = 'block';
+
+            // Immediately reconnect (no wait for loop)
             connectAndStream(currentIP);
         }
     });
 
     visionSelect.addEventListener('change', (e) => {
-        const f = filters[e.target.value];
-        img.style.filter = f;
-        videoEl.style.filter = f;
+        const filter = filters[e.target.value];
+        img.style.filter = filter;
+        video.style.filter = filter;
     });
 
-    if (currentIP !== "camcorder") connectAndStream(currentIP);
+    runForever();
   </script>
 </body>
 </html>
